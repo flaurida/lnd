@@ -45,14 +45,21 @@ const (
 	// for the funding transaction to be confirmed before forgetting about
 	// the channel. 288 blocks is ~48 hrs
 	maxWaitNumBlocksFundingConf = 288
+
+	// idleChannelCutoff is the time in minutes after which reservations
+	// that are started but not ultimately completed can achieve zombie
+	// status and be manually cancelled by the CancelIdleReservations
+	// goroutine.
+	idleChannelCutoff = 10
 )
 
 // reservationWithCtx encapsulates a pending channel reservation. This wrapper
 // struct is used internally within the funding manager to track and progress
 // the funding workflow initiated by incoming/outgoing methods from the target
-// peer. Additionally, this struct houses a response and error channel which is
-// used to respond to the caller in the case a channel workflow is initiated
-// via a local signal such as RPC.
+// peer. It also stores the time in which it was created so it is possible to
+// tell how long ago the reservation was started. Additionally, this struct
+// houses a response and error channel which is used to respond to the caller
+// in the case a channel workflow is initiated via a local signal such as RPC.
 //
 // TODO(roasbeef): actually use the context package
 //  * deadlines, etc.
@@ -60,7 +67,8 @@ type reservationWithCtx struct {
 	reservation *lnwallet.ChannelReservation
 	peerAddress *lnwire.NetAddress
 
-	chanAmt btcutil.Amount
+	chanAmt   btcutil.Amount
+	createdAt time.Time
 
 	updates chan *lnrpc.OpenStatusUpdate
 	err     chan error
@@ -756,6 +764,7 @@ func (f *fundingManager) handleFundingOpen(fmsg *fundingOpenMsg) {
 	f.activeReservations[peerIDKey][msg.PendingChannelID] = &reservationWithCtx{
 		reservation: reservation,
 		chanAmt:     amt,
+		createdAt:   time.Now(),
 		err:         make(chan error, 1),
 		peerAddress: fmsg.peerAddress,
 	}
@@ -1850,6 +1859,7 @@ func (f *fundingManager) handleInitFundingMsg(msg *initFundingMsg) {
 		chanAmt:     capacity,
 		reservation: reservation,
 		peerAddress: msg.peerAddress,
+		createdAt:   time.Now(),
 		updates:     msg.updates,
 		err:         msg.err,
 	}
@@ -1958,8 +1968,8 @@ func (f *fundingManager) handleErrorMsg(fmsg *fundingErrorMsg) {
 	}
 }
 
-// cancelReservationCtx do all needed work in order to securely cancel the
-// reservation.
+// cancelReservationCtx does all needed work in order to securely cancel
+// the reservation.
 func (f *fundingManager) cancelReservationCtx(peerKey *btcec.PublicKey,
 	pendingChanID [32]byte) (*reservationWithCtx, error) {
 
@@ -2105,4 +2115,42 @@ func (f *fundingManager) deleteChannelOpeningState(chanPoint *wire.OutPoint) err
 		}
 		return nil
 	})
+}
+
+// CancelIdleReservations manually cancels channel reservations that
+// are started but not ultimately completed after 10 minutes. It
+// returns the slice of cancelled idle reservations.
+func (f *fundingManager) CancelIdleReservations() ([]*reservationWithCtx,
+	error) {
+	// Create a slice to hold cancelled channel reservations.
+	var cancelled []*reservationWithCtx
+
+	// Calculate the cutoff time (10 minutes ago) to determine which
+	// idle reservations to cancel.
+	cutoffTime := time.Now().Add(-idleChannelCutoff * time.Minute)
+
+	// Loop through the pending channels in each pending funding workflow.
+	for serializedPubKey, pendingChannels := range f.activeReservations {
+		// Loop through pending single funded channels in pending
+		// channels map.
+		for pendingChanID, ctx := range pendingChannels {
+			// Check if reservation was created before cutoff time.
+			if ctx.createdAt.Before(cutoffTime) {
+				// If so, cancel the reservation and add it to the slice of
+				// cancelled reservations.
+				if err := ctx.reservation.Cancel(); err != nil {
+					return cancelled,
+						errors.Errorf("unable to cancel reservation: %v", err)
+				}
+
+				f.resMtx.Lock()
+				delete(f.activeReservations[serializedPubKey], pendingChanID)
+				f.resMtx.Unlock()
+
+				cancelled = append(cancelled, ctx)
+			}
+		}
+	}
+
+	return cancelled, nil
 }
