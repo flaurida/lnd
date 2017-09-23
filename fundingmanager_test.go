@@ -64,6 +64,8 @@ var (
 		IdentityKey: bobPubKey,
 		Address:     bobTCPAddr,
 	}
+
+	idleReservationAge = 20
 )
 
 type mockNotifier struct {
@@ -1015,4 +1017,63 @@ func TestFundingManagerFundingTimeout(t *testing.T) {
 		t.Fatalf("Expected Bob to have 0 pending channel, had  %v",
 			len(pendingChannels))
 	}
+}
+
+type mockReservation struct{}
+func (m *mockReservation) Cancel() error {
+	return nil
+}
+
+func createTestActiveReservation(t *testing.T, f *fundingManager,
+	peerIDKey serializedPubKey, old bool) (ctx *reservationWithCtx) {
+
+	if _, ok := f.activeReservations[peerIDKey]; !ok {
+		f.activeReservations[peerIDKey] = make(pendingChannels)
+	}
+
+	createdAt := time.Now().Add(-idleChannelCutoff * time.Minute)
+
+	if !old {
+		createdAt = time.Now()
+	}
+
+	ctx = &reservationWithCtx{
+		createdAt: createdAt,
+		reservation: mockReservation{},
+	}
+
+	f.activeReservations[peerIDKey][bobPrivKeyBytes] = ctx
+
+	return ctx
+}
+
+func TestCancelIdleReservations(t *testing.T) {
+	shutdownChannel := make(chan struct{})
+
+	// setupFundingManagers could probably be refactored to use setup
+	// single funding manager helper method, seems like a lot of duplicate
+	// code then you could also just use one for some of the smaller tests
+	alice, bob := setupFundingManagers(t, shutdownChannel)
+	defer tearDownFundingManagers(t, alice, bob, shutdownChannel)
+
+	peerIDKey := newSerializedKey(bobPubKey)
+
+	createTestActiveReservation(t, alice.fundingMgr, peerIDKey, false)
+	createTestActiveReservation(t, alice.fundingMgr, peerIDKey, true)
+
+	idleReservations, err := alice.fundingMgr.CancelIdleReservations()
+	fmt.Println(idleReservations)
+
+	if err != nil {
+		t.Fatalf("failed during CancelIdleReservations: %v", err)
+	}
+
+	// if (len(idleReservations) != 1) {
+	// 	t.Fatalf("Expected to cancel 1 idle reservation, cancelled %v instead",
+	// 		len(idleReservations))
+	// }
+	//
+	// if (idleReservations[0] != oldCtx) {
+	// 	t.Fatalf("Expect to cancel reservation from 20 minutes ago")
+	// }
 }
